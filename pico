@@ -1,0 +1,381 @@
+#Adrian Łabudziński
+import time
+import board
+import digitalio
+import usb_hid
+import displayio
+import busio
+import adafruit_st7789
+import adafruit_display_shapes
+#import adafruit_display_text
+from adafruit_hid.keyboard import Keyboard
+from adafruit_hid.keyboard_layout_us import KeyboardLayoutUS as KeyboardLayout
+from adafruit_hid.keycode import Keycode
+from adafruit_hid.mouse import Mouse
+from board import *
+import pwmio
+import microcontroller
+
+microcontroller.cpu.temperature
+temp = str(microcontroller.cpu.temperature)
+displayio.release_displays()
+
+tft_cs = board.GP9
+tft_dc = board.GP8
+tft_res = board.GP12
+spi_mosi = board.GP11
+spi_clk = board.GP10
+spi = busio.SPI(spi_clk, MOSI=spi_mosi)
+
+display_bus = displayio.FourWire(
+    spi, command=tft_dc, chip_select=tft_cs, reset=tft_res)
+
+display = adafruit_st7789.ST7789(display_bus, width=240, height=240, rowstart=80, colstart=0)
+color_bitmap = displayio.Bitmap(240, 240, 2)
+color_palette = displayio.Palette(3)
+color_palette[0] = 0xFF0000 # red
+color_palette[1] = 0xFF0000 # red
+color_palette[2] = 0x0000FF # blue
+
+bg_sprite = displayio.TileGrid(color_bitmap, pixel_shader=color_palette, x=5, y=5)
+
+inner_bitmap = displayio.Bitmap(240, 240, 1)
+inner_palette = displayio.Palette(1)
+inner_palette[0] = 0x0000FF
+inner_sprite = displayio.TileGrid(inner_bitmap, pixel_shader=inner_palette, x=80, y=80)
+
+# display orientation
+rot = 270
+display.rotation = rot
+
+a = digitalio.DigitalInOut(board.GP3)
+a.direction = digitalio.Direction.INPUT
+a.pull = digitalio.Pull.UP
+
+b = digitalio.DigitalInOut(board.GP18)
+b.direction = digitalio.Direction.INPUT
+b.pull = digitalio.Pull.UP
+
+c = digitalio.DigitalInOut(board.GP16)
+c.direction = digitalio.Direction.INPUT
+c.pull = digitalio.Pull.UP
+
+d = digitalio.DigitalInOut(board.GP19)
+d.direction = digitalio.Direction.INPUT
+d.pull = digitalio.Pull.UP
+
+led = digitalio.DigitalInOut(board.GP25)
+led.direction = digitalio.Direction.OUTPUT
+
+mouse = Mouse(usb_hid.devices)
+
+kbd = Keyboard(usb_hid.devices)
+layout = KeyboardLayout(kbd)
+defaultDelay = 0
+
+# The keyboard object!
+
+
+# buttons A, B, Y , UP, DOWN, LEFT, RIGHT AND SELECT
+keypress_pins = [board.GP15, board.GP17, board.GP2, board.GP20, board.GP21]
+# Our array of key objects
+key_pin_array = []
+# The Keycode sent for each button, will be paired with a control key
+keys_pressed = ["djuaP*^da18", "Haslo_tymczasowe3", "igR+*Srn9_@1", "https://ekursy.put.poznan.pl/login/index.php", "laskdjghdfaiqrwjhgiuaq(*&^%jhddfc2893765rJKLHOIUGH"]
+control_key = Keycode.SHIFT
+
+time.sleep(1)  # Sleep for a bit to avoid a race condition on some systems
+keyboard = Keyboard(usb_hid.devices)
+keyboard_layout = KeyboardLayout(keyboard)  
+
+# Make all pin objects inputs with pullups
+for pin in keypress_pins:
+    key_pin = digitalio.DigitalInOut(pin)
+    key_pin.direction = digitalio.Direction.INPUT
+    key_pin.pull = digitalio.Pull.UP
+    key_pin_array.append(key_pin)
+
+# hasloinator name give my son Michał he like Fineasz i Ferb
+def hasloinator():
+    print("")
+    print("     .---." + "    cpu_temp = "+ temp + "*C")
+    print("    /     \________________")
+    print("   (  ( )  ____   _   _   _)")
+    print("    \     /    | | | | | |" )
+    print("     `---'     |_| '-' |_|\n")
+    print(" PASSWORD A      - SKRZYNKA GMAIL")
+    print(" PASSWORD B      - KOMPUTER PRACA ")
+    print(" PASSWORD X      - HACKS CONSOLE ")
+    print(" PASSWORD Y      - SKRZYNKA OUTLOOK")
+    print(" PASSWORD UP     - PP")
+    print(" PASSWORD RIGHT  - EKURSY")
+    print(" SELECT          - LOCK ")
+    print("\n WAITING FOR PASSWORD SELECTION...")
+    
+    while True:
+        if d.value == False:
+            duckyCommands = {
+                'WINDOWS': Keycode.WINDOWS, 'GUI': Keycode.GUI,
+                'APP': Keycode.APPLICATION, 'MENU': Keycode.APPLICATION, 'SHIFT': Keycode.SHIFT,
+                'ALT': Keycode.ALT, 'CONTROL': Keycode.CONTROL, 'CTRL': Keycode.CONTROL,
+                'DOWNARROW': Keycode.DOWN_ARROW, 'DOWN': Keycode.DOWN_ARROW, 'LEFTARROW': Keycode.LEFT_ARROW,
+                'LEFT': Keycode.LEFT_ARROW, 'RIGHTARROW': Keycode.RIGHT_ARROW, 'RIGHT': Keycode.RIGHT_ARROW,
+                'UPARROW': Keycode.UP_ARROW, 'UP': Keycode.UP_ARROW, 'BREAK': Keycode.PAUSE,
+                'PAUSE': Keycode.PAUSE, 'CAPSLOCK': Keycode.CAPS_LOCK, 'DELETE': Keycode.DELETE,
+                'END': Keycode.END, 'ESC': Keycode.ESCAPE, 'ESCAPE': Keycode.ESCAPE, 'HOME': Keycode.HOME,
+                'INSERT': Keycode.INSERT, 'NUMLOCK': Keycode.KEYPAD_NUMLOCK, 'PAGEUP': Keycode.PAGE_UP,
+                'PAGEDOWN': Keycode.PAGE_DOWN, 'PRINTSCREEN': Keycode.PRINT_SCREEN, 'ENTER': Keycode.ENTER,
+                'SCROLLLOCK': Keycode.SCROLL_LOCK, 'SPACE': Keycode.SPACE, 'TAB': Keycode.TAB,
+                'BACKSPACE': Keycode.BACKSPACE,
+                'A': Keycode.A, 'B': Keycode.B, 'C': Keycode.C, 'D': Keycode.D, 'E': Keycode.E,
+                'F': Keycode.F, 'G': Keycode.G, 'H': Keycode.H, 'I': Keycode.I, 'J': Keycode.J,
+                'K': Keycode.K, 'L': Keycode.L, 'M': Keycode.M, 'N': Keycode.N, 'O': Keycode.O,
+                'P': Keycode.P, 'Q': Keycode.Q, 'R': Keycode.R, 'S': Keycode.S, 'T': Keycode.T,
+                'U': Keycode.U, 'V': Keycode.V, 'W': Keycode.W, 'X': Keycode.X, 'Y': Keycode.Y,
+                'Z': Keycode.Z, 'F1': Keycode.F1, 'F2': Keycode.F2, 'F3': Keycode.F3,
+                'F4': Keycode.F4, 'F5': Keycode.F5, 'F6': Keycode.F6, 'F7': Keycode.F7,
+                'F8': Keycode.F8, 'F9': Keycode.F9, 'F10': Keycode.F10, 'F11': Keycode.F11,
+                'F12': Keycode.F12,
+
+            }
+            def convertLine(line):
+                newline = []
+                # loop on each key - the filter removes empty values
+                for key in filter(None, line.split(" ")):
+                    key = key.upper()
+                    # find the keycode for the command in the list
+                    command_keycode = duckyCommands.get(key, None)
+                    if command_keycode is not None:
+                    # if it exists in the list, use it
+                        newline.append(command_keycode)
+                    elif hasattr(Keycode, key):
+                    # if it's in the Keycode module, use it (allows any valid keycode)
+                        newline.append(getattr(Keycode, key))
+                    else:
+                    # if it's not a known key name, show the error for diagnosis
+                        print(f"Unknown key: <{key}>")
+                # print(newline)
+                return newline
+
+            def runScriptLine(line):
+                for k in line:
+                    kbd.press(k)
+                kbd.release_all()
+
+            def sendString(line):
+                layout.write(line)
+
+            def parseLine(line):
+                global defaultDelay
+                if(line[0:3] == "REM"):
+                # ignore ducky script comments
+                    pass
+                elif(line[0:5] == "DELAY"):
+                    time.sleep(float(line[6:])/1000)
+                elif(line[0:6] == "STRING"):
+                    sendString(line[7:])
+                elif(line[0:5] == "PRINT"):
+                    print("[SCRIPT]: " + line[6:])
+                elif(line[0:6] == "IMPORT"):
+                    runScript(line[7:])
+                elif(line[0:13] == "DEFAULT_DELAY"):
+                    defaultDelay = int(line[14:]) * 10
+                elif(line[0:12] == "DEFAULTDELAY"):
+                    defaultDelay = int(line[13:]) * 10
+        
+                else:
+                    newScriptLine = convertLine(line)
+                    runScriptLine(newScriptLine)
+
+
+
+    # turn off automatically reloading when files are written to the pico
+            #supervisor.disable_autoreload()
+
+    # sleep at the start to allow the device to be recognized by the host computer
+            #time.sleep(.5)
+    
+    
+    
+    #def getProgrammingStatus():
+    # check GP0 for setup mode
+    # see setup mode for instructions
+        #progStatusPin = digitalio.DigitalInOut(GP0)
+        #progStatusPin.switch_to_input(pull=digitalio.Pull.UP)
+        #progStatus = not progStatusPin.value
+        #return(progStatus)
+
+
+    
+
+            def runScript(file):
+                global defaultDelay
+
+                duckyScriptPath = file
+                try:
+                    f = open(duckyScriptPath,"r",encoding='utf-8')
+                    previousLine = ""
+                    for line in f:
+                        line = line.rstrip()
+                        if(line[0:6] == "REPEAT"):
+                            for i in range(int(line[7:])):
+                    #repeat the last command
+                                parseLine(previousLine)
+                                time.sleep(float(defaultDelay)/1000)
+                        else:
+                            parseLine(line)
+                            previousLine = line
+                        time.sleep(float(defaultDelay)/1000)
+                except OSError as e:
+                    print("Unable to open file ", file)
+    #now its not working propertly i have to change this to have option in selecting hacks
+            def selectPayload():
+                print("  SELECT     -  WIFI GRABBER")
+                print("  LEFT       -  SELENIUM")
+                print("  przycisk   -  nazwa hacka")
+                print("  przycisk   -  nazwa hacka")
+                print("  DOWN       -  BACK TO MAIN MENU")    
+                while True:
+                    
+                    if a.value == False:
+                        payload = "payload1.dd"
+                        return payload
+                    elif b.value == False:
+                        hasloinator()
+                    elif c.value == False:
+                        #lewo
+                        hack()
+                    else:
+                        continue
+                time.sleep(0.01)  
+                
+
+    #progStatus = False
+    #progStatus = getProgrammingStatus()
+
+            while True:
+    # not in setup mode, inject the payload
+                payload = selectPayload()
+        #print("Running ", payload)
+                runScript(payload)
+                hasloinator()
+                break;
+        #print("Done")
+    #else:
+        #print("Update your payload")
+
+
+
+            #hack()
+        else:
+            for key_pin in key_pin_array:
+                if not key_pin.value:  # Is it grounded?
+                    i = key_pin_array.index(key_pin)
+                #print("Password #{} was chosen.".format(i))
+    
+                # Turn on the LED
+                    led.value = True
+
+                    while not key_pin.value:
+                        pass  # Wait for it to be ungrounded!
+            # "Type" the Keycode or string
+                    key = keys_pressed[i]  # Get the corresponding Keycode or string
+                    if isinstance(key, str):  # If it's a string...
+                        keyboard_layout.write(key)  # ...Print the string
+                    else:  # If it's not a string...
+                        keyboard.press(control_key, key)  # "Press"...
+                        keyboard.release_all()  # ..."Release"!
+
+            # Turn off the LED
+                    led.value = False
+            if a.value == False:
+                print("")
+                print("   .--------. ")
+                print("  / .------. \ ")
+                print(" / /        \ \.")
+                print(" | |        | |")
+                print(" | |        | |___________")
+                print(" | |     .' |_|        ( ) '. ")
+                print("  #      '._____ ____ _____.' ")
+                print("         |     .'____'.     | ")
+                print("         '.__.'.'    '.'.__.' ")
+                print("         '.__  |      |  __.' ")
+                print("         |   '.'.____.'.'   | ")
+                print("         '.____'.____.'____.' ")
+                print("         '.________________.' ")
+                print("\n           CLOSING THE LOCK")
+                time.sleep(1)
+                unlock()
+            time.sleep(0.01)   
+def unlock1():
+    while True:
+        if b.value == False:
+            print("")
+            print("   .--------. ")
+            print("  / .------. \ ")
+            print(" / /        \ \.")
+            print(" | |        | |")
+            print(" | |        | |___________")
+            print(" | |     .' |_|        ( ) '. ")
+            print("  #      '._____ ____ _____.' ")
+            print("         |     .'____'.     | ")
+            print("         '.__.'.'    '.'.__.' ")
+            print("         '.__  |      |  __.' ")
+            print("         |   '.'.____.'.'   | ")
+            print("         '.____'.____.'____.' ")
+            print("         '.________________.' ")
+            print("\n               UNLOCKED")
+            time.sleep(3)
+            hasloinator()
+        else:
+            continue
+    time.sleep(0.01)        
+            
+def unlock():
+    print(4 * "\n")
+    print("              .--------. ")
+    print("             / .------. \ ")
+    print("            / /        \ \.")
+    print("            | |        | |")
+    print("           _| |________| |_")
+    print("         .' |_|        |_| '. ")
+    print("         '._____ ____ _____.' ")
+    print("         |     .'____'.     | ")
+    print("         '.__.'.'    '.'.__.' ")
+    print("         '.__  |      |  __.' ")
+    print("         |   '.'.____.'.'   | ")
+    print("         '.____'.____.'____.' ")
+    print("         '.________________.' ")
+    print("\n       ENTER PASSWORD TO UNLOCK")
+    while True:
+        if c.value == False:
+            unlock1()
+        else:
+            led.value = True
+            mouse.move(x=500)
+            led.value = False
+            time.sleep(0.2)
+            
+            led.value = True
+            mouse.move(y=200)
+            led.value = False
+            time.sleep(0.2)
+            
+            led.value = True
+            mouse.move(x=-500)
+            led.value = False
+            time.sleep(0.2)
+            
+            led.value = True
+            mouse.move(y=-200)
+            led.value = False
+            time.sleep(0.2)
+            time.sleep(0.01)
+                
+while True:
+    unlock()
+
+
+
+
+
