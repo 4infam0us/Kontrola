@@ -1,0 +1,1139 @@
+"""
+Predykcja pobrań narzędzi — WinTool + Dane z produkcji (v2.0)
+
+Co robi aplikacja:
+- Importuje 2 pliki Excel:
+  1) PRODUKCJA (kolumny dokładnie):
+     total_time | part_no | qty | date | done_date | machine
+     - total_time = czas całkowity na wszystkie sztuki (może być "3,4" albo 3.4)
+     - date = termin (deadline) kiedy powinno być wykonane (wymagane)
+     - done_date = data zejścia z wydziału (puste = jeszcze nie wykonano)
+     - machine = np. "VTC INTEGREX QT200" (oddzielone spacją; runtime dzielimy równo)
+
+     Logika:
+       jeśli done_date istnieje => rekord DONE i agregujemy po done_date
+       jeśli done_date puste    => rekord PLANNED i agregujemy po date
+
+  2) POBRANIA WinTool (kolumny dokładnie):
+     issue_time | item_name | qty | info
+     - qty może mieć przecinek (np. "1,0") => program sam zamieni na kropkę
+     - info: miks (czasem nr rysunku, czasem nazwa maszyny; w przyszłości oba)
+
+- Przypisuje pobrania do maszyn:
+  1) jeśli w info jest maszyna (QT200/INTEGREX/VTC/VARIAXIS) => ta maszyna
+  2) else jeśli w info jest part_no => przypisuje wg mapy part_no->maszyny z produkcji (równo na maszyny)
+  3) else => UNKNOWN (pokazane w podglądzie)
+
+- Buduje dane tygodniowe (ISO week):
+  runtime_done[week,machine]    = suma total_time (DONE)
+  runtime_planned[week,machine] = suma total_time (PLANNED)
+  issues_weekly[week,machine,tool] = suma pobrań
+
+- Trenuje model per (maszyna, narzędzie):
+  Ridge regression (bez scikit-learn) z cechami:
+    [1, runtime_week, sin(week_of_year), cos(week_of_year)]
+  i przewiduje pobrania na przyszłe tygodnie z runtime_planned.
+
+- Generuje PDF z wykresami i tabelą.
+
+Wymagania:
+  pip install pandas openpyxl numpy matplotlib reportlab
+
+Uruchom:
+  python tool_forecast_mix_v2.py
+"""
+
+import os
+import re
+import math
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, date
+
+import numpy as np
+import pandas as pd
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import matplotlib.pyplot as plt
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+
+
+DB_PATH = "tool_forecast_mix.db"
+
+MACHINES = ["QT200", "INTEGREX", "VTC", "VARIAXIS"]
+MACHINE_PATTERN = re.compile(r"\b(" + "|".join(map(re.escape, MACHINES)) + r")\b", re.IGNORECASE)
+
+# part_no: np. CBS-000124, OPM-002021 (litery/cyfry, myślnik, cyfry)
+PARTNO_PATTERN = re.compile(r"\b[A-Z0-9]{2,}-\d{3,}\b", re.IGNORECASE)
+
+
+# -------------------- DB --------------------
+
+def db_connect():
+    return sqlite3.connect(DB_PATH)
+
+
+def db_init():
+    con = db_connect()
+    cur = con.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS production_raw (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        part_no TEXT NOT NULL,
+        dt TEXT NOT NULL,
+        qty REAL NOT NULL,
+        total_time REAL NOT NULL,
+        machine_raw TEXT NOT NULL,
+        status TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS issues_raw (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issue_ts TEXT NOT NULL,
+        item_name TEXT NOT NULL,
+        qty REAL NOT NULL,
+        info TEXT
+    )
+    """)
+
+    con.commit()
+    con.close()
+
+
+def clear_table(table: str):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(f"DELETE FROM {table}")
+    con.commit()
+    con.close()
+
+
+def insert_many(table: str, columns: list[str], rows: list[tuple]):
+    con = db_connect()
+    cur = con.cursor()
+    placeholders = ",".join(["?"] * len(columns))
+    col_sql = ",".join(columns)
+    cur.executemany(f"INSERT INTO {table}({col_sql}) VALUES ({placeholders})", rows)
+    con.commit()
+    con.close()
+
+
+def fetch_all(sql: str, params=()):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+
+# -------------------- Helpers --------------------
+
+def to_iso_date(x) -> str:
+    """Excel date/str -> ISO YYYY-MM-DD"""
+    if pd.isna(x) or x is None or str(x).strip() == "":
+        raise ValueError("Empty date")
+    if isinstance(x, datetime):
+        return x.date().isoformat()
+    if isinstance(x, date):
+        return x.isoformat()
+    return pd.to_datetime(str(x)).date().isoformat()
+
+
+def parse_decimal(x) -> float:
+    """
+    Bezpieczny parser liczby:
+    - jeśli jest string z przecinkiem -> zamienia na kropkę
+    - obsługuje float/int
+    """
+    if pd.isna(x) or x is None:
+        raise ValueError("Empty numeric")
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+    s = str(x).strip()
+    if not s:
+        raise ValueError("Empty numeric")
+    # zamiana tylko jeśli wygląda jak liczba z przecinkiem dziesiętnym
+    # np. "3,4" -> "3.4"
+    s2 = s.replace(" ", "")
+    if "," in s2 and "." not in s2:
+        s2 = s2.replace(",", ".")
+    # jeżeli jest i "," i ".", to nie zgadujemy (np. "1,234.56") -> spróbujmy usunąć tysiące:
+    # dla PL często będzie "1 234,56" więc powyżej już zadziała
+    try:
+        return float(s2)
+    except ValueError:
+        # ostatnia próba: usuń separatory tysięcy (przecinki/spacje) i spróbuj ponownie
+        s3 = s2.replace(",", "").replace(" ", "")
+        return float(s3)
+
+
+def week_key(iso_date: str) -> str:
+    d = datetime.fromisoformat(iso_date).date()
+    y, w, _ = d.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def week_of_year_from_weekkey(wk: str) -> int:
+    return int(wk.split("-W")[1])
+
+
+def parse_machine_list(machine_raw: str) -> list[str]:
+    """
+    machine_raw: np. "VTC INTEGREX QT200" (spacje)
+    Zwraca listę rozpoznanych maszyn (unikalne, zachowując kolejność).
+    """
+    raw = (machine_raw or "").strip()
+    if not raw:
+        return []
+    toks = [t.strip() for t in raw.split() if t.strip()]
+    out = []
+    for t in toks:
+        tU = t.upper()
+        if tU in MACHINES:
+            out.append(tU)
+    # fallback: regex w całym stringu
+    if not out:
+        m = MACHINE_PATTERN.search(raw)
+        if m:
+            out = [m.group(1).upper()]
+    # unique
+    seen = set()
+    uniq = []
+    for m in out:
+        if m not in seen:
+            seen.add(m)
+            uniq.append(m)
+    return uniq
+
+
+def extract_machine_from_info(info: str) -> str | None:
+    if not info:
+        return None
+    m = MACHINE_PATTERN.search(info)
+    return m.group(1).upper() if m else None
+
+
+def extract_partnos_from_info(info: str) -> list[str]:
+    if not info:
+        return []
+    found = PARTNO_PATTERN.findall(info.upper())
+    # unique preserve order
+    return list(dict.fromkeys(found))
+
+
+# -------------------- Importers --------------------
+
+def import_production_excel(path: str) -> tuple[int, dict]:
+    """
+    Wymagane kolumny:
+      total_time, part_no, qty, date, done_date, machine
+    done_date może być puste.
+
+    Logika dat:
+      - DONE (done_date istnieje): dt = done_date
+      - PLANNED (done_date puste): dt = date (deadline), ALE
+          jeśli deadline < dzisiaj -> to opóźnione -> przesuwamy na poniedziałek bieżącego tygodnia
+          (żeby nie prognozować "w 2025", gdy mamy 2026)
+
+    total_time i qty mogą mieć przecinek dziesiętny — program sam zamieni na kropkę.
+    """
+
+    from datetime import timedelta  # lokalnie, żeby nie wymagać zmian na górze pliku
+
+    def clamp_planned_date_to_current_week(plan_dt_iso: str) -> tuple[str, bool]:
+        """Zwraca (dt_iso, shifted). shifted=True jeśli plan był w przeszłości i został przesunięty."""
+        plan_d = datetime.fromisoformat(plan_dt_iso).date()
+        today = date.today()
+        if plan_d >= today:
+            return plan_dt_iso, False
+        monday = today - timedelta(days=today.weekday())
+        return monday.isoformat(), True
+
+    df = pd.read_excel(path)
+
+    required = {"total_time", "part_no", "qty", "date", "done_date", "machine"}
+    if not required.issubset(set(df.columns)):
+        raise ValueError(f"Brak kolumn. Wymagane: {required}. Masz: {list(df.columns)}")
+
+    stats = {
+        "rows_total": 0,
+        "rows_saved": 0,
+        "rows_skipped": 0,
+        "comma_fixed_total_time": 0,
+        "comma_fixed_qty": 0,
+        "missing_date": 0,
+        "done": 0,
+        "planned": 0,
+        "planned_overdue_shifted_to_current_week": 0,
+        "machines_unparsed": 0,
+    }
+
+    rows = []
+    for _, r in df.iterrows():
+        stats["rows_total"] += 1
+
+        part_no = str(r["part_no"]).strip().upper()
+        if not part_no:
+            stats["rows_skipped"] += 1
+            continue
+
+        # date (deadline) is required
+        try:
+            plan_dt = to_iso_date(r["date"])
+        except Exception:
+            stats["missing_date"] += 1
+            stats["rows_skipped"] += 1
+            continue
+
+        # done_date optional
+        done_dt = ""
+        if pd.notna(r["done_date"]) and str(r["done_date"]).strip() != "":
+            try:
+                done_dt = to_iso_date(r["done_date"])
+            except Exception:
+                done_dt = ""  # traktuj jako brak
+
+        status = "done" if done_dt else "planned"
+        if status == "done":
+            stats["done"] += 1
+        else:
+            stats["planned"] += 1
+
+        machine_raw = str(r["machine"]).strip()
+        machines = parse_machine_list(machine_raw)
+        if not machines:
+            # nadal zapisujemy rekord, ale nie wejdzie do agregacji runtime
+            stats["machines_unparsed"] += 1
+
+        # qty i total_time z auto-konwersją przecinka
+        raw_qty = r["qty"]
+        raw_tt = r["total_time"]
+
+        if isinstance(raw_qty, str) and "," in raw_qty and "." not in raw_qty:
+            stats["comma_fixed_qty"] += 1
+        if isinstance(raw_tt, str) and "," in raw_tt and "." not in raw_tt:
+            stats["comma_fixed_total_time"] += 1
+
+        try:
+            qty = parse_decimal(raw_qty)
+            total_time = parse_decimal(raw_tt)
+        except Exception:
+            stats["rows_skipped"] += 1
+            continue
+
+        if qty < 0 or total_time < 0:
+            stats["rows_skipped"] += 1
+            continue
+
+        # Ustal dt (do agregacji tygodniowej)
+        if done_dt:
+            effective_dt = done_dt
+        else:
+            # PLANNED: jeśli deadline w przeszłości, przesuń na bieżący tydzień
+            new_plan_dt, shifted = clamp_planned_date_to_current_week(plan_dt)
+            if shifted:
+                stats["planned_overdue_shifted_to_current_week"] += 1
+            effective_dt = new_plan_dt
+
+        rows.append((part_no, effective_dt, qty, total_time, machine_raw, status))
+        stats["rows_saved"] += 1
+
+    clear_table("production_raw")
+    insert_many(
+        "production_raw",
+        ["part_no", "dt", "qty", "total_time", "machine_raw", "status"],
+        rows
+    )
+
+    return len(rows), stats
+
+
+def import_issues_excel(path: str) -> tuple[int, dict]:
+    """
+    Wymagane kolumny:
+      issue_time, item_name, qty, info
+
+    qty może mieć przecinek.
+    """
+    df = pd.read_excel(path)
+
+    required = {"issue_time", "item_name", "qty", "info"}
+    if not required.issubset(set(df.columns)):
+        raise ValueError(f"Brak kolumn. Wymagane: {required}. Masz: {list(df.columns)}")
+
+    stats = {
+        "rows_total": 0,
+        "rows_saved": 0,
+        "rows_skipped": 0,
+        "comma_fixed_qty": 0,
+        "missing_time": 0
+    }
+
+    rows = []
+    for _, r in df.iterrows():
+        stats["rows_total"] += 1
+
+        it = r["issue_time"]
+        if pd.isna(it) or str(it).strip() == "":
+            stats["missing_time"] += 1
+            stats["rows_skipped"] += 1
+            continue
+
+        # timestamp
+        try:
+            if isinstance(it, datetime):
+                issue_ts = it.isoformat(sep=" ", timespec="seconds")
+            else:
+                issue_ts = pd.to_datetime(str(it)).to_pydatetime().isoformat(sep=" ", timespec="seconds")
+        except Exception:
+            stats["rows_skipped"] += 1
+            continue
+
+        item_name = str(r["item_name"]).strip()
+        if not item_name:
+            stats["rows_skipped"] += 1
+            continue
+
+        raw_qty = r["qty"]
+        if isinstance(raw_qty, str) and "," in raw_qty and "." not in raw_qty:
+            stats["comma_fixed_qty"] += 1
+
+        try:
+            qty = parse_decimal(raw_qty)
+        except Exception:
+            stats["rows_skipped"] += 1
+            continue
+
+        if qty == 0:
+            stats["rows_skipped"] += 1
+            continue
+
+        if qty < 0:
+            # WinTool często daje wydanie jako liczba ujemna
+            qty = abs(qty)
+
+        info = "" if pd.isna(r["info"]) else str(r["info"]).strip()
+
+        rows.append((issue_ts, item_name, qty, info))
+        stats["rows_saved"] += 1
+
+    clear_table("issues_raw")
+    insert_many(
+        "issues_raw",
+        ["issue_ts", "item_name", "qty", "info"],
+        rows
+    )
+    return len(rows), stats
+
+
+# -------------------- Data prep --------------------
+
+@dataclass
+class PreparedData:
+    runtime_done: dict[tuple[str, str], float]          # (week, machine) -> total_time
+    runtime_planned: dict[tuple[str, str], float]       # (week, machine) -> total_time
+    issues_weekly: dict[tuple[str, str, str], float]    # (week, machine, tool) -> qty
+    unknown_issues: list[tuple[int, str, str, float, str]]  # (id, issue_ts, item, qty, info)
+    stats_assign: dict
+
+
+def build_part_to_machines_map() -> dict[str, list[str]]:
+    rows = fetch_all("SELECT DISTINCT part_no, machine_raw FROM production_raw")
+    mp: dict[str, list[str]] = {}
+    for part_no, machine_raw in rows:
+        machines = parse_machine_list(machine_raw)
+        if not machines:
+            continue
+        if part_no not in mp:
+            mp[part_no] = machines
+        else:
+            for m in machines:
+                if m not in mp[part_no]:
+                    mp[part_no].append(m)
+    return mp
+
+
+def aggregate_runtime(status: str) -> dict[tuple[str, str], float]:
+    """
+    runtime = total_time
+    jeśli machine_raw ma wiele maszyn -> dzielimy runtime równo.
+    """
+    rows = fetch_all("""
+        SELECT dt, total_time, machine_raw
+        FROM production_raw
+        WHERE status = ?
+    """, (status,))
+
+    out: dict[tuple[str, str], float] = {}
+    for dt, total_time, machine_raw in rows:
+        wk = week_key(dt)
+        machines = parse_machine_list(machine_raw)
+        if not machines:
+            continue
+        share = float(total_time) / float(len(machines))
+        for m in machines:
+            key = (wk, m)
+            out[key] = out.get(key, 0.0) + share
+    return out
+
+
+def prepare_weekly_data() -> PreparedData:
+    part_to_machines = build_part_to_machines_map()
+
+    runtime_done = aggregate_runtime("done")
+    runtime_planned = aggregate_runtime("planned")
+
+    issues_rows = fetch_all(
+        "SELECT id, issue_ts, item_name, qty, COALESCE(info,'') FROM issues_raw ORDER BY issue_ts ASC"
+    )
+
+    issues_weekly: dict[tuple[str, str, str], float] = {}
+    unknown: list[tuple[int, str, str, float, str]] = []
+
+    stats_assign = {
+        "assigned_by_machine_in_info": 0,
+        "assigned_by_partno_in_info": 0,
+        "unknown": 0
+    }
+
+    for _id, issue_ts, item_name, qty, info in issues_rows:
+        wk = week_key(to_iso_date(pd.to_datetime(issue_ts)))
+        tool = str(item_name).strip()
+
+        # 1) machine from info
+        m = extract_machine_from_info(info)
+        if m:
+            key = (wk, m, tool)
+            issues_weekly[key] = issues_weekly.get(key, 0.0) + float(qty)
+            stats_assign["assigned_by_machine_in_info"] += 1
+            continue
+
+        # 2) part_no from info
+        parts = extract_partnos_from_info(info)
+        assigned = False
+        for pn in parts:
+            machines = part_to_machines.get(pn.upper(), [])
+            if machines:
+                share = float(qty) / float(len(machines))
+                for mm in machines:
+                    key = (wk, mm, tool)
+                    issues_weekly[key] = issues_weekly.get(key, 0.0) + share
+                stats_assign["assigned_by_partno_in_info"] += 1
+                assigned = True
+                break  # bierzemy pierwsze trafienie
+
+        if assigned:
+            continue
+
+        # 3) unknown
+        unknown.append((int(_id), issue_ts, tool, float(qty), info))
+        stats_assign["unknown"] += 1
+
+    return PreparedData(
+        runtime_done=runtime_done,
+        runtime_planned=runtime_planned,
+        issues_weekly=issues_weekly,
+        unknown_issues=unknown,
+        stats_assign=stats_assign
+    )
+
+
+# -------------------- Modeling (Ridge) --------------------
+
+def make_features_for_weeks(weeks: list[str], runtime_map: dict[tuple[str, str], float], machine: str) -> np.ndarray:
+    """
+    X shape: (n, 4) => [1, runtime, sin(woy), cos(woy)]
+    """
+    X = np.zeros((len(weeks), 4), dtype=float)
+    for i, wk in enumerate(weeks):
+        woy = week_of_year_from_weekkey(wk)
+        runtime = runtime_map.get((wk, machine), 0.0)
+        ang = 2.0 * math.pi * (woy / 52.0)
+        X[i, 0] = 1.0
+        X[i, 1] = float(runtime)
+        X[i, 2] = math.sin(ang)
+        X[i, 3] = math.cos(ang)
+    return X
+
+
+def ridge_fit_predict(X_train: np.ndarray, y_train: np.ndarray, X_pred: np.ndarray, lam: float = 10.0) -> np.ndarray:
+    """
+    w = (X^T X + lam I)^-1 X^T y
+    """
+    XtX = X_train.T @ X_train
+    I = np.eye(XtX.shape[0])
+    w = np.linalg.solve(XtX + lam * I, X_train.T @ y_train)
+    y_hat = X_pred @ w
+    return np.clip(y_hat, 0.0, None)
+
+
+@dataclass
+class ForecastRow:
+    week: str
+    machine: str
+    tool: str
+    forecast_qty: float
+
+
+def build_forecast(prep: PreparedData, lam: float = 10.0, min_history_weeks: int = 6) -> list[ForecastRow]:
+    hist_weeks = sorted({wk for (wk, _m) in prep.runtime_done.keys()})
+    fut_weeks = sorted({wk for (wk, _m) in prep.runtime_planned.keys()})
+
+    if not fut_weeks or not hist_weeks:
+        return []
+
+    tools_by_machine: dict[str, set[str]] = {m: set() for m in MACHINES}
+    for (wk, m, tool), qty in prep.issues_weekly.items():
+        if m in tools_by_machine and qty > 0:
+            tools_by_machine[m].add(tool)
+
+    out: list[ForecastRow] = []
+
+    for machine in MACHINES:
+        X_hist = make_features_for_weeks(hist_weeks, prep.runtime_done, machine)
+        X_fut = make_features_for_weeks(fut_weeks, prep.runtime_planned, machine)
+
+        if X_hist.shape[0] < min_history_weeks:
+            continue
+
+        for tool in sorted(tools_by_machine.get(machine, set())):
+            y = np.zeros((len(hist_weeks),), dtype=float)
+            for i, wk in enumerate(hist_weeks):
+                y[i] = prep.issues_weekly.get((wk, machine, tool), 0.0)
+
+            if float(np.sum(y)) <= 0.0:
+                continue
+
+            y_hat = ridge_fit_predict(X_hist, y, X_fut, lam=lam)
+            for i, wk in enumerate(fut_weeks):
+                qty = float(y_hat[i])
+                if qty <= 0:
+                    continue
+                out.append(ForecastRow(week=wk, machine=machine, tool=tool, forecast_qty=qty))
+
+    out.sort(key=lambda r: (r.week, r.machine, -r.forecast_qty, r.tool))
+    return out
+
+
+# -------------------- PDF reporting --------------------
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def chart_top_tools(forecast: list[ForecastRow], out_png: str, title: str, top_n: int = 15) -> bool:
+    total: dict[str, float] = {}
+    for r in forecast:
+        k = f"{r.machine} | {r.tool}"
+        total[k] = total.get(k, 0.0) + r.forecast_qty
+
+    items = sorted(total.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    if not items:
+        return False
+
+    labels = [k for k, _ in items][::-1]
+    values = [v for _, v in items][::-1]
+
+    plt.figure(figsize=(10, 6))
+    plt.barh(labels, values)
+    plt.title(title)
+    plt.xlabel("Prognozowane pobrania (suma)")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+    return True
+
+
+def chart_weekly_total(forecast: list[ForecastRow], out_png: str, title: str) -> bool:
+    totals: dict[str, float] = {}
+    for r in forecast:
+        totals[r.week] = totals.get(r.week, 0.0) + r.forecast_qty
+    items = sorted(totals.items(), key=lambda x: x[0])
+    if not items:
+        return False
+
+    x = [k for k, _ in items]
+    y = [v for _, v in items]
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(x, y, marker="o")
+    plt.title(title)
+    plt.xlabel("Tydzień")
+    plt.ylabel("Suma pobrań")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+    return True
+
+def register_polish_fonts():
+    """
+    Rejestruje fonty TTF z polskimi znakami.
+    Najpierw próbuje DejaVuSans (zalecane), potem Arial jako fallback.
+    Jeśli chcesz 100% pewności, wrzuć DejaVuSans.ttf i DejaVuSans-Bold.ttf
+    do folderu z aplikacją.
+    """
+    base_dir = os.path.dirname(__file__)
+
+    candidates_regular = [
+        os.path.join(base_dir, "DejaVuSans.ttf"),
+        r"C:\Windows\Fonts\DejaVuSans.ttf",
+        r"C:\Windows\Fonts\dejavusans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        r"C:\Windows\Fonts\arial.ttf",  # fallback (ma PL znaki)
+    ]
+    candidates_bold = [
+        os.path.join(base_dir, "DejaVuSans-Bold.ttf"),
+        r"C:\Windows\Fonts\DejaVuSans-Bold.ttf",
+        r"C:\Windows\Fonts\dejavusans-bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",  # Arial Bold fallback
+    ]
+
+    reg_path = next((p for p in candidates_regular if os.path.exists(p)), None)
+    bold_path = next((p for p in candidates_bold if os.path.exists(p)), None)
+
+    if not reg_path:
+        raise FileNotFoundError(
+            "Nie znaleziono fontu TTF z polskimi znakami.\n"
+            "Rozwiązanie: wrzuć DejaVuSans.ttf do folderu z aplikacją "
+            "albo upewnij się, że masz Arial w C:\\Windows\\Fonts."
+        )
+
+    pdfmetrics.registerFont(TTFont("PLFont", reg_path))
+
+    # Bold jest opcjonalny — jeśli go nie ma, będziemy używać PLFont również dla nagłówków
+    if bold_path:
+        pdfmetrics.registerFont(TTFont("PLFontBold", bold_path))
+        return "PLFont", "PLFontBold"
+
+    return "PLFont", "PLFont"
+
+
+def export_pdf(pdf_path: str, forecast: list[ForecastRow], prep: PreparedData, created_at: str):
+    pl_font, pl_font_bold = register_polish_fonts()
+
+    out_dir = os.path.dirname(pdf_path) or "."
+    tmp_dir = os.path.join(out_dir, "_tmp_assets")
+    ensure_dir(tmp_dir)
+
+    img1 = os.path.join(tmp_dir, "top_tools.png")
+    img2 = os.path.join(tmp_dir, "weekly_total.png")
+
+    has1 = chart_top_tools(forecast, img1, "Top (maszyna | narzędzie) — prognoza")
+    has2 = chart_weekly_total(forecast, img2, "Suma prognozowanych pobrań tygodniowo")
+
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    W, H = A4
+
+    def header():
+        c.setFont(pl_font_bold, 14)
+        c.drawString(18 * mm, H - 18 * mm, "Raport — Predykcja pobrań narzędzi (WinTool + Produkcja)")
+        c.setFont(pl_font, 9)
+        c.drawString(18 * mm, H - 24 * mm, f"Data raportu: {created_at}")
+        c.line(18 * mm, H - 26 * mm, W - 18 * mm, H - 26 * mm)
+
+    # --- Strona 1: wykresy + podsumowanie ---
+    header()
+    y = H - 35 * mm
+
+    if has1:
+        c.setFont(pl_font_bold, 11)
+        c.drawString(18 * mm, y, "Wykres 1: Największe prognozowane pobrania")
+        y -= 5 * mm
+        c.drawImage(
+            img1, 18 * mm, y - 80 * mm,
+            width=W - 36 * mm, height=80 * mm,
+            preserveAspectRatio=True, anchor='sw'
+        )
+        y -= 90 * mm
+
+    if has2:
+        c.setFont(pl_font_bold, 11)
+        c.drawString(18 * mm, y, "Wykres 2: Suma prognozowanych pobrań tygodniowo")
+        y -= 5 * mm
+        c.drawImage(
+            img2, 18 * mm, y - 55 * mm,
+            width=W - 36 * mm, height=55 * mm,
+            preserveAspectRatio=True, anchor='sw'
+        )
+        y -= 65 * mm
+
+    # podsumowanie przypisania
+    c.setFont(pl_font_bold, 11)
+    c.drawString(18 * mm, 18 * mm + 42 * mm, "Podsumowanie przypisania pobrań do maszyn:")
+    c.setFont(pl_font, 9)
+    s = prep.stats_assign
+    c.drawString(18 * mm, 18 * mm + 36 * mm, f"• po maszynie w info: {s.get('assigned_by_machine_in_info', 0)}")
+    c.drawString(18 * mm, 18 * mm + 31 * mm, f"• po part_no w info: {s.get('assigned_by_partno_in_info', 0)}")
+    c.drawString(18 * mm, 18 * mm + 26 * mm, f"• UNKNOWN: {s.get('unknown', 0)}")
+
+    c.showPage()
+
+    # --- Strona 2+: tabela prognozy ---
+    header()
+    c.setFont(pl_font_bold, 12)
+    c.drawString(18 * mm, H - 35 * mm, "Tabela prognozy (tydzień → maszyna → narzędzie)")
+
+    col_x = [18 * mm, 40 * mm, 65 * mm, 85 * mm]
+    headers = ["Tydzień", "Maszyna", "Ilość", "Narzędzie"]
+
+    c.setFont(pl_font_bold, 9)
+    y = H - 45 * mm
+    for x, htxt in zip(col_x, headers):
+        c.drawString(x, y, htxt)
+    c.line(18 * mm, y - 2 * mm, W - 18 * mm, y - 2 * mm)
+    y -= 7 * mm
+
+    c.setFont(pl_font, 9)
+    for r in forecast:
+        if y < 20 * mm:
+            c.showPage()
+            header()
+            c.setFont(pl_font_bold, 12)
+            c.drawString(18 * mm, H - 35 * mm, "Tabela prognozy (cd.)")
+
+            c.setFont(pl_font_bold, 9)
+            y = H - 45 * mm
+            for x, htxt in zip(col_x, headers):
+                c.drawString(x, y, htxt)
+            c.line(18 * mm, y - 2 * mm, W - 18 * mm, y - 2 * mm)
+            y -= 7 * mm
+            c.setFont(pl_font, 9)
+
+        c.drawString(col_x[0], y, r.week)
+        c.drawString(col_x[1], y, r.machine)
+        c.drawRightString(col_x[2] + 15 * mm, y, f"{r.forecast_qty:.2f}")
+        max_width = W - 20 * mm - col_x[3]
+
+        tool_text = r.tool
+        while c.stringWidth(tool_text, pl_font, 9) > max_width and len(tool_text) > 3:
+            tool_text = tool_text[:-1]
+
+        if tool_text != r.tool:
+            tool_text = tool_text[:-3] + "..."
+
+        c.drawString(col_x[3], y, tool_text)
+        y -= 5.2 * mm
+
+    c.showPage()
+    c.save()
+
+    # cleanup obrazków
+    try:
+        for p in [img1, img2]:
+            if os.path.exists(p):
+                os.remove(p)
+        if os.path.isdir(tmp_dir) and not os.listdir(tmp_dir):
+            os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+
+
+# -------------------- UI --------------------
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Predykcja pobrań narzędzi — WinTool + Produkcja (v2.0)")
+        self.geometry("1420x880")
+
+        self.prep: PreparedData | None = None
+        self.forecast: list[ForecastRow] = []
+
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True)
+
+        self.tab_import = ttk.Frame(self.nb)
+        self.tab_preview = ttk.Frame(self.nb)
+        self.tab_forecast = ttk.Frame(self.nb)
+
+        self.nb.add(self.tab_import, text="Import")
+        self.nb.add(self.tab_preview, text="Podgląd / Walidacja")
+        self.nb.add(self.tab_forecast, text="Predykcja + PDF")
+
+        self._build_import_tab()
+        self._build_preview_tab()
+        self._build_forecast_tab()
+
+    # ---- Import ----
+    def _build_import_tab(self):
+        frm = ttk.Frame(self.tab_import, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        info = (
+            "Plik 1 (Produkcja) — nagłówki MUSZĄ być dokładnie:\n"
+            "  total_time | part_no | qty | date | done_date | machine\n"
+            "  • date = termin (deadline) — wymagane\n"
+            "  • done_date = data zejścia z wydziału (puste = do wykonania)\n"
+            "  • total_time i qty mogą mieć przecinek dziesiętny (np. 3,4) — program sam zamieni na kropkę\n"
+            "  • machine: np. 'VTC INTEGREX QT200' (spacje) — runtime dzielony równo na maszyny\n\n"
+            "Plik 2 (WinTool pobrania) — nagłówki:\n"
+            "  issue_time | item_name | qty | info\n"
+            "  • qty z przecinkiem też OK\n"
+            "  • info: miks (part_no i/lub maszyna). Najpierw próbujemy maszynę, potem part_no.\n"
+        )
+        ttk.Label(frm, text=info, justify="left").pack(anchor="w")
+
+        btns = ttk.Frame(frm)
+        btns.pack(anchor="w", pady=12)
+
+        ttk.Button(btns, text="Import PRODUKCJI (Excel)", command=self.on_import_production).pack(side="left", padx=6)
+        ttk.Button(btns, text="Import POBRAŃ (WinTool Excel)", command=self.on_import_issues).pack(side="left", padx=6)
+        ttk.Button(btns, text="Przygotuj dane (agregacja)", command=self.on_prepare).pack(side="left", padx=6)
+
+        self.txt_import_log = tk.Text(frm, height=10, width=160)
+        self.txt_import_log.pack(fill="x", pady=10)
+        self.txt_import_log.insert("end", "Log importu pojawi się tutaj.\n")
+        self.txt_import_log.configure(state="disabled")
+
+    def _log(self, s: str):
+        self.txt_import_log.configure(state="normal")
+        self.txt_import_log.insert("end", s.rstrip() + "\n")
+        self.txt_import_log.see("end")
+        self.txt_import_log.configure(state="disabled")
+
+    def on_import_production(self):
+        path = filedialog.askopenfilename(title="Wybierz Excel produkcji", filetypes=[("Excel", "*.xlsx *.xls")])
+        if not path:
+            return
+        try:
+            n, stats = import_production_excel(path)
+            self._log(f"[PRODUKCJA] Zaimportowano {n} wierszy z: {path}")
+            self._log(f"  total: {stats['rows_total']} | saved: {stats['rows_saved']} | skipped: {stats['rows_skipped']}")
+            self._log(f"  done: {stats['done']} | planned: {stats['planned']} | missing date: {stats['missing_date']}")
+            self._log(f"  auto-fix przecinek: total_time={stats['comma_fixed_total_time']} | qty={stats['comma_fixed_qty']}")
+            self._log(f"  nie rozpoznano maszyn w polu machine (wpisy zapisane, ale nie wejdą do agregacji): {stats['machines_unparsed']}")
+        except Exception as e:
+            messagebox.showerror("Błąd", f"Import produkcji nieudany:\n{e}")
+
+    def on_import_issues(self):
+        path = filedialog.askopenfilename(title="Wybierz Excel pobrań WinTool", filetypes=[("Excel", "*.xlsx *.xls")])
+        if not path:
+            return
+        try:
+            n, stats = import_issues_excel(path)
+            self._log(f"[POBRANIA] Zaimportowano {n} wierszy z: {path}")
+            self._log(f"  total: {stats['rows_total']} | saved: {stats['rows_saved']} | skipped: {stats['rows_skipped']} | missing time: {stats['missing_time']}")
+            self._log(f"  auto-fix przecinek qty: {stats['comma_fixed_qty']}")
+        except Exception as e:
+            messagebox.showerror("Błąd", f"Import pobrań nieudany:\n{e}")
+
+    def on_prepare(self):
+        try:
+            self.prep = prepare_weekly_data()
+        except Exception as e:
+            messagebox.showerror("Błąd", f"Nie udało się przygotować danych:\n{e}")
+            return
+
+        self.refresh_preview()
+        s = self.prep.stats_assign
+        self._log("[PREP] Przygotowano agregaty tygodniowe.")
+        self._log(f"  przypisanie pobrań: po maszynie w info={s.get('assigned_by_machine_in_info',0)}, "
+                  f"po part_no w info={s.get('assigned_by_partno_in_info',0)}, UNKNOWN={s.get('unknown',0)}")
+        messagebox.showinfo("OK", "Dane przygotowane. Sprawdź zakładkę 'Podgląd / Walidacja'.")
+
+    # ---- Preview ----
+    def _build_preview_tab(self):
+        frm = ttk.Frame(self.tab_preview, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        lf1 = ttk.LabelFrame(frm, text="Runtime tygodniowo (DONE vs PLANNED) — total_time dzielone równo na maszyny", padding=10)
+        lf1.pack(fill="both", expand=True)
+
+        self.tree_runtime = ttk.Treeview(
+            lf1,
+            columns=("week", "machine", "runtime_done", "runtime_planned"),
+            show="headings",
+            height=12
+        )
+        for col, head in [
+            ("week", "Tydzień"),
+            ("machine", "Maszyna"),
+            ("runtime_done", "Runtime DONE"),
+            ("runtime_planned", "Runtime PLANNED"),
+        ]:
+            self.tree_runtime.heading(col, text=head)
+        self.tree_runtime.column("week", width=100, anchor="w")
+        self.tree_runtime.column("machine", width=100, anchor="w")
+        self.tree_runtime.column("runtime_done", width=160, anchor="e")
+        self.tree_runtime.column("runtime_planned", width=170, anchor="e")
+        self.tree_runtime.pack(fill="both", expand=True)
+
+        lf2 = ttk.LabelFrame(frm, text="Pobrania UNKNOWN (nie udało się przypisać do maszyny)", padding=10)
+        lf2.pack(fill="both", expand=True, pady=(10, 0))
+
+        self.tree_unknown = ttk.Treeview(
+            lf2,
+            columns=("id", "issue_ts", "item", "qty", "info"),
+            show="headings",
+            height=12
+        )
+        for col, head in [
+            ("id", "id"),
+            ("issue_ts", "czas"),
+            ("item", "narzędzie"),
+            ("qty", "ilość"),
+            ("info", "info"),
+        ]:
+            self.tree_unknown.heading(col, text=head)
+        self.tree_unknown.column("id", width=60, anchor="e")
+        self.tree_unknown.column("issue_ts", width=150, anchor="w")
+        self.tree_unknown.column("item", width=420, anchor="w")
+        self.tree_unknown.column("qty", width=90, anchor="e")
+        self.tree_unknown.column("info", width=630, anchor="w")
+        self.tree_unknown.pack(fill="both", expand=True)
+
+    def refresh_preview(self):
+        if not self.prep:
+            return
+
+        for i in self.tree_runtime.get_children():
+            self.tree_runtime.delete(i)
+        for i in self.tree_unknown.get_children():
+            self.tree_unknown.delete(i)
+
+        weeks = sorted(
+            {wk for (wk, _m) in self.prep.runtime_done.keys()} |
+            {wk for (wk, _m) in self.prep.runtime_planned.keys()}
+        )
+
+        rows = []
+        for wk in weeks:
+            for m in MACHINES:
+                rd = self.prep.runtime_done.get((wk, m), 0.0)
+                rp = self.prep.runtime_planned.get((wk, m), 0.0)
+                if rd == 0 and rp == 0:
+                    continue
+                rows.append((wk, m, rd, rp))
+
+        for wk, m, rd, rp in rows[:3000]:
+            self.tree_runtime.insert("", "end", values=(wk, m, f"{rd:.2f}", f"{rp:.2f}"))
+
+        for _id, issue_ts, item, qty, info in self.prep.unknown_issues[:3000]:
+            self.tree_unknown.insert("", "end", values=(_id, issue_ts, item, f"{qty:.2f}", info))
+
+    # ---- Forecast ----
+    def _build_forecast_tab(self):
+        frm = ttk.Frame(self.tab_forecast, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        controls = ttk.Frame(frm)
+        controls.pack(fill="x")
+
+        ttk.Label(controls, text="Ridge lambda (większe = bardziej gładkie):").pack(side="left")
+        self.ent_lam = ttk.Entry(controls, width=10)
+        self.ent_lam.insert(0, "10")
+        self.ent_lam.pack(side="left", padx=6)
+
+        ttk.Label(controls, text="Min. tygodni historii na model:").pack(side="left")
+        self.ent_min_hist = ttk.Entry(controls, width=10)
+        self.ent_min_hist.insert(0, "6")
+        self.ent_min_hist.pack(side="left", padx=6)
+
+        ttk.Button(controls, text="Policz predykcję", command=self.on_forecast).pack(side="left", padx=10)
+        ttk.Button(controls, text="Eksport PDF", command=self.on_export_pdf).pack(side="left", padx=6)
+
+        self.tree_forecast = ttk.Treeview(
+            frm,
+            columns=("week", "machine", "qty", "tool"),
+            show="headings",
+            height=28
+        )
+        for col, head in [
+            ("week", "Tydzień"),
+            ("machine", "Maszyna"),
+            ("qty", "Prognoza ilości"),
+            ("tool", "Narzędzie (item_name)"),
+        ]:
+            self.tree_forecast.heading(col, text=head)
+        self.tree_forecast.column("week", width=100, anchor="w")
+        self.tree_forecast.column("machine", width=100, anchor="w")
+        self.tree_forecast.column("qty", width=140, anchor="e")
+        self.tree_forecast.column("tool", width=950, anchor="w")
+        self.tree_forecast.pack(fill="both", expand=True, pady=10)
+
+        self.lbl_forecast = ttk.Label(frm, text="—")
+        self.lbl_forecast.pack(anchor="w")
+
+    def on_forecast(self):
+        if not self.prep:
+            messagebox.showerror("Błąd", "Najpierw zaimportuj pliki i kliknij 'Przygotuj dane (agregacja)'.")
+            return
+
+        try:
+            lam = float(self.ent_lam.get().replace(",", "."))
+            min_hist = int(self.ent_min_hist.get().strip())
+        except Exception:
+            messagebox.showerror("Błąd", "Niepoprawne parametry lambda / min history.")
+            return
+
+        self.forecast = build_forecast(self.prep, lam=lam, min_history_weeks=min_hist)
+
+        for i in self.tree_forecast.get_children():
+            self.tree_forecast.delete(i)
+
+        for r in self.forecast[:8000]:
+            self.tree_forecast.insert("", "end", values=(r.week, r.machine, f"{r.forecast_qty:.2f}", r.tool))
+
+        s = self.prep.stats_assign if self.prep else {}
+        self.lbl_forecast.config(
+            text=f"Prognoza wierszy: {len(self.forecast)} | UNKNOWN pobrań: {s.get('unknown',0)}"
+        )
+
+        if not self.forecast:
+            messagebox.showinfo(
+                "Info",
+                "Brak prognozy.\n\n"
+                "Najczęstsze powody:\n"
+                "• brak PLANNED (done_date puste) z terminami date w danych produkcji\n"
+                "• brak historycznych pobrań przypisanych do maszyn (za dużo UNKNOWN)\n"
+                "• zbyt mało tygodni historii (zmniejsz 'Min. tygodni historii')"
+            )
+
+    def on_export_pdf(self):
+        if not self.prep:
+            messagebox.showerror("Błąd", "Brak danych (agregacja).")
+            return
+        if not self.forecast:
+            messagebox.showerror("Błąd", "Najpierw policz predykcję.")
+            return
+
+        default_name = f"tool_forecast_report_{date.today().isoformat()}.pdf"
+        path = filedialog.asksaveasfilename(
+            title="Zapisz raport PDF",
+            defaultextension=".pdf",
+            initialfile=default_name,
+            filetypes=[("PDF", "*.pdf")]
+        )
+        if not path:
+            return
+
+        try:
+            export_pdf(path, self.forecast, self.prep, created_at=datetime.now().strftime("%Y-%m-%d %H:%M"))
+        except Exception as e:
+            messagebox.showerror("Błąd", f"Nie udało się wygenerować PDF:\n{e}")
+            return
+
+        messagebox.showinfo("OK", f"Zapisano raport:\n{path}")
+
+
+# -------------------- main --------------------
+
+if __name__ == "__main__":
+    db_init()
+    app = App()
+    app.mainloop()
+
